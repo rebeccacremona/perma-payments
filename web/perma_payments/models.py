@@ -24,6 +24,7 @@ RN_SET = "0123456789"
 REFERENCE_NUMBER_PREFIX = "PERMA"
 STANDING_STATUSES = ['Current', 'Hold']
 CUSTOMER_TYPES = ['Registrar', 'Individual']
+PAYMENT_PROVIDERS = ['cybersource', 'stripe']
 
 
 #
@@ -118,6 +119,12 @@ class SubscriptionAgreement(SubscriptionAndPurchaseMixin):
         return 'SubscriptionAgreement {}'.format(self.id)
 
     history = HistoricalRecords()
+    payment_provider = models.CharField(
+        max_length=20,
+        choices=((key, key) for key in PAYMENT_PROVIDERS),
+        default='cybersource',
+        help_text="Which payment provider backs this agreement (CyberSource or Stripe)."
+    )
     status = models.CharField(
         max_length=20,
         choices=(
@@ -307,6 +314,125 @@ class SubscriptionAgreement(SubscriptionAndPurchaseMixin):
         self.paid_through = self.calculate_paid_through_date_from_reported_status(self.status)
         self.save(update_fields=['status', 'current_link_limit', 'current_link_limit_effective_timestamp', 'current_rate', 'current_frequency', 'paid_through'])
         logger.log(mapped['log_level'], mapped['message'])
+
+
+class StripeCheckoutSession(models.Model):
+    """
+    Stripe metadata for an in-progress or completed Checkout Session used to start a subscription.
+    Kept separate from SubscriptionAgreement to avoid bloating the core model during a mixed-provider era.
+    """
+    def __str__(self):
+        return f"StripeCheckoutSession {self.id} ({self.checkout_session_id})"
+
+    subscription_agreement = models.OneToOneField(
+        SubscriptionAgreement,
+        related_name='stripe_checkout_session',
+        on_delete=models.CASCADE
+    )
+    checkout_session_id = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="Stripe Checkout Session id (cs_...)"
+    )
+    livemode = models.BooleanField(
+        default=False,
+        help_text="Stripe flag indicating whether this object was created in live mode (true) vs test mode (false)."
+    )
+    metadata = models.JSONField(blank=True, null=True)
+    created_date = models.DateTimeField(auto_now_add=True)
+    updated_date = models.DateTimeField(auto_now=True)
+
+
+class StripeSubscription(models.Model):
+    """
+    Stripe subscription/customer identifiers for a SubscriptionAgreement.
+    """
+    def __str__(self):
+        return f"StripeSubscription {self.id} ({self.subscription_id})"
+
+    subscription_agreement = models.OneToOneField(
+        SubscriptionAgreement,
+        related_name='stripe_subscription',
+        on_delete=models.CASCADE
+    )
+    subscription_id = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="Stripe Subscription id (sub_...)"
+    )
+    customer_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text="Stripe Customer id (cus_...)"
+    )
+    livemode = models.BooleanField(
+        default=False,
+        help_text="Stripe flag indicating whether this object was created in live mode (true) vs test mode (false)."
+    )
+    created_date = models.DateTimeField(auto_now_add=True)
+    updated_date = models.DateTimeField(auto_now=True)
+
+
+class StripeEvent(models.Model):
+    """
+    Stores every Stripe webhook event (encrypted) for audit/debug and idempotency.
+    """
+    PROCESSING_STATUSES = ['pending', 'processed', 'failed']
+
+    def __str__(self):
+        return f"StripeEvent {self.id} ({self.event_id})"
+
+    def clean(self, *args, **kwargs):
+        super(StripeEvent, self).clean(*args, **kwargs)
+        if not self.payload_encrypted:
+            raise ValidationError({'payload_encrypted': 'This field cannot be blank.'})
+
+    event_id = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="Stripe Event id (evt_...)"
+    )
+    type = models.CharField(max_length=255)
+    api_version = models.CharField(max_length=50, blank=True, null=True)
+    livemode = models.BooleanField(
+        default=False,
+        help_text="Stripe flag indicating whether this event was generated in live mode (true) vs test mode (false)."
+    )
+    created = models.DateTimeField(
+        blank=True,
+        null=True,
+        help_text="Event creation time as reported by Stripe."
+    )
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(blank=True, null=True)
+    processing_status = models.CharField(
+        max_length=20,
+        choices=((key, key) for key in PROCESSING_STATUSES),
+        default='pending'
+    )
+    last_error = models.TextField(blank=True, null=True)
+    payload_encrypted = models.BinaryField(
+        help_text="The full webhook payload, encrypted, in case we ever need it."
+    )
+    encryption_key_id = models.IntegerField()
+
+    @classmethod
+    def save_new_with_encrypted_payload(cls, payload, fields):
+        """
+        Saves a new StripeEvent instance, encrypting the payload.
+        `fields` must include at least: event_id, type, livemode; may include api_version, created, etc.
+        """
+        data = {
+            'encryption_key_id': settings.STORAGE_ENCRYPTION_KEYS['id'],
+            'payload_encrypted': encrypt_for_storage(
+                stringify_data(payload)
+            )
+        }
+        data.update(fields)
+        event = cls(**data)
+        event.save()
+        return event
 
 
 class OutgoingTransaction(PolymorphicModel):
