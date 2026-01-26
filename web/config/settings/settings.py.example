@@ -33,3 +33,14 @@ PERMA_ENCRYPTION_KEYS = {
 
 # Admin
 ADMIN_URL = 'admin/'
+
+STRIPE_SECRET_KEY = 'sk_test_etc'
+STRIPE_PRICE_IDS = {
+    "monthly": {
+        "10.00": "price_asdf",
+        "25.00": "price_hhlj",
+        "100.00": "price_qwiehrp"
+    },
+    "annually": {
+    }
+}

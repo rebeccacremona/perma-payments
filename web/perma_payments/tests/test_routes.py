@@ -9,6 +9,7 @@ These are integration tests covering:
 
 import csv
 import io
+import json
 from datetime import datetime
 import logging
 
@@ -17,6 +18,8 @@ from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError, ObjectDoesNotExist, MultipleObjectsReturned
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils.timezone import make_aware
+
+import stripe
 
 
 import pytest
@@ -124,6 +127,15 @@ def subscribe():
     }
     for field in FIELDS_REQUIRED_FROM_PERMA['subscribe']:
         assert field in data['valid_data']
+    return data
+
+
+@pytest.fixture
+def stripe_subscribe(subscribe):
+    # Same payload shape as /subscribe/, but different route and response behavior.
+    data = dict(subscribe)
+    data['route'] = '/stripe/subscribe/'
+    data.pop('template', None)
     return data
 
 
@@ -755,6 +767,76 @@ def test_subscribe_get(client, subscribe, index):
     response = client.get(subscribe['route'])
     assert response.status_code == 200
     expected_template_used(response, index['template'])
+
+
+# stripe/subscribe
+
+def test_stripe_subscribe_post_invalid_perma_transmission(client, stripe_subscribe, mocker):
+    process = mocker.patch(
+        'perma_payments.views.process_perma_transmission',
+        autospec=True,
+        side_effect=InvalidTransmissionException
+    )
+    create_session = mocker.patch('perma_payments.views.stripe.checkout.Session.create', autospec=True)
+
+    response = client.post(stripe_subscribe['route'], stripe_subscribe['valid_data'])
+
+    assert response.status_code == 400
+    expected_template_used(response, 'generic.html')
+    assert b'Bad Request' in response.content
+    process.assert_called_once_with(
+        dict_to_querydict(stripe_subscribe['valid_data']),
+        FIELDS_REQUIRED_FROM_PERMA['subscribe']
+    )
+    assert not create_session.called
+
+
+def test_stripe_subscribe_post_happy_path_redirects_to_stripe(client, stripe_subscribe, settings, mocker):
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    settings.STRIPE_SUCCESS_URL = "https://example.com/success?session_id={CHECKOUT_SESSION_ID}"
+    settings.STRIPE_CANCEL_URL = "https://example.com/cancel"
+
+    mocker.patch('perma_payments.views.process_perma_transmission', autospec=True, return_value=stripe_subscribe['valid_data'])
+    mocker.patch('perma_payments.views.transaction.atomic', autospec=True)
+    mocker.patch('perma_payments.views._stripe_price_id_for_subscription_request', autospec=True, return_value='price_123')
+
+    sa = mocker.patch('perma_payments.views.SubscriptionAgreement', autospec=True)
+    sa.customer_standing_subscription.return_value = None
+    sa_instance = sa.return_value
+    sa_instance.pk = 101
+    sa_instance.customer_pk = stripe_subscribe['valid_data']['customer_pk']
+    sa_instance.customer_type = stripe_subscribe['valid_data']['customer_type']
+
+    sr = mocker.patch('perma_payments.views.SubscriptionRequest', autospec=True)
+    sr_instance = sr.return_value
+    sr_instance.pk = 202
+    sr_instance.reference_number = "PERMA-0000-0000"
+
+    session = Mock()
+    session.id = "cs_test_123"
+    session.url = "https://checkout.stripe.com/pay/cs_test_123"
+    session.livemode = False
+    create_session = mocker.patch(
+        'perma_payments.views.stripe.checkout.Session.create',
+        autospec=True,
+        return_value=session
+    )
+
+    stripe_checkout_session = mocker.patch('perma_payments.views.StripeCheckoutSession', autospec=True)
+
+    response = client.post(stripe_subscribe['route'])
+
+    assert response.status_code == 302
+    assert response['Location'] == session.url
+    sa.assert_called_once_with(
+        customer_pk=stripe_subscribe['valid_data']['customer_pk'],
+        customer_type=stripe_subscribe['valid_data']['customer_type'],
+        status='Pending',
+        payment_provider='stripe',
+    )
+    sr.assert_called_once()
+    assert create_session.call_count == 1
+    assert stripe_checkout_session.objects.create.call_count == 1
 
 
 # change

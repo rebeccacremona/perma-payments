@@ -10,6 +10,7 @@ urlpatterns = [
     re_path(r'^acknowledge-purchase/$', views.acknowledge_purchase, name='acknowledge_purchase'),
     re_path(r'^purchase-history/$', views.purchase_history, name='purchase_history'),
     re_path(r'^subscribe/$', views.subscribe, name='subscribe'),
+    re_path(r'^stripe/subscribe/$', views.stripe_subscribe, name='stripe_subscribe'),
     re_path(r'^subscription/$', views.subscription, name='subscription'),
     re_path(r'^update-statuses/$', views.update_statuses, name='update_statuses'),
     re_path(r'^update/$', views.update, name='update'),

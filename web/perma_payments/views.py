@@ -15,6 +15,8 @@ from django.views.decorators.debug import sensitive_post_parameters
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import csrf_exempt
 
+import stripe
+
 from .constants import (
     CS_PAYMENT_URL,
     CS_SUBSCRIPTION_SEARCH_URL,
@@ -33,7 +35,8 @@ from .models import (
     SubscriptionRequestResponse,
     ChangeRequestResponse,
     UpdateRequestResponse,
-    PurchaseRequestResponse
+    PurchaseRequestResponse,
+    StripeCheckoutSession,
 )
 from .security import (
    InvalidTransmissionException,
@@ -225,6 +228,42 @@ def formatted_date_or_none(dt):
     return None
 
 
+def _stripe_price_id_for_subscription_request(subscription_request):
+    """
+    Resolve the Stripe price id (price_...) for a given SubscriptionRequest.
+
+    Expected config shape (only):
+    - dict: {"monthly": {"10.00": "price_..."}, "annually": {"100.00": "price_..."}}
+      (May also be provided as a JSON-encoded string that decodes to this dict.)
+    """
+    price_ids = getattr(settings, 'STRIPE_PRICE_IDS', {}) or {}
+    if isinstance(price_ids, str):
+        if not price_ids.strip():
+            price_ids = {}
+        else:
+            try:
+                price_ids = json.loads(price_ids)
+            except json.JSONDecodeError:
+                raise ValueError("STRIPE_PRICE_IDS must be a dict, or a JSON string that decodes to a dict.")
+    if not isinstance(price_ids, dict):
+        raise ValueError("STRIPE_PRICE_IDS must be a dict mapping frequency -> {amount -> price_id}.")
+
+    frequency = subscription_request.recurring_frequency
+    amount_str = f"{subscription_request.recurring_amount:.2f}"
+
+    nested = price_ids.get(frequency)
+    if not isinstance(nested, dict):
+        raise KeyError(
+            f"No Stripe price mapping found for frequency={frequency!r}. "
+            f"Expected STRIPE_PRICE_IDS['{frequency}'] to be a dict of amount strings to price ids."
+        )
+
+    price = nested.get(amount_str)
+    if not isinstance(price, str) or not price:
+        raise KeyError(f"No Stripe price mapping found for frequency={frequency!r}, amount={amount_str!r}.")
+    return price
+
+
 #
 # VIEWS
 #
@@ -394,6 +433,109 @@ def subscribe(request):
     return render(request, 'redirect.html', context)
 
 
+@csrf_exempt
+@require_http_methods(["POST"])
+@sensitive_post_parameters('encrypted_data')
+def stripe_subscribe(request):
+    """
+    Parallel pilot: like `subscribe`, but redirects to Stripe Checkout (hosted) in subscription mode.
+
+    Expects a Perma-encrypted `encrypted_data` payload containing the same fields as `/subscribe/`.
+    """
+    try:
+        data = process_perma_transmission(request.POST, FIELDS_REQUIRED_FROM_PERMA['subscribe'])
+    except InvalidTransmissionException:
+        return bad_request(request)
+
+    # The user must not already have a standing subscription.
+    if SubscriptionAgreement.customer_standing_subscription(data['customer_pk'], data['customer_type']):
+        return render(request, 'generic.html', {
+            'heading': "Good News!",
+            'message': "You already have a subscription to Perma.cc.<br>" +
+                       "If you believe you have reached this page in error, please contact us at <a href='mailto:{0}?subject=Our%20Subscription'>{0}</a>.".format(settings.DEFAULT_CONTACT_EMAIL)
+        })
+
+    # Settings must be present.
+    if not getattr(settings, 'STRIPE_SECRET_KEY', ''):
+        logger.error("STRIPE_SECRET_KEY is not configured; cannot create Stripe Checkout Session.")
+        return bad_request(request)
+    if not getattr(settings, 'STRIPE_SUCCESS_URL', '') or not getattr(settings, 'STRIPE_CANCEL_URL', ''):
+        logger.error("STRIPE_SUCCESS_URL / STRIPE_CANCEL_URL not configured; cannot create Stripe Checkout Session.")
+        return bad_request(request)
+
+    # The subscription request fields must each be valid.
+    try:
+        with transaction.atomic():
+            s_agreement = SubscriptionAgreement(
+                customer_pk=data['customer_pk'],
+                customer_type=data['customer_type'],
+                status='Pending',
+                payment_provider='stripe',
+            )
+            s_agreement.full_clean()
+            s_agreement.save()
+
+            s_request = SubscriptionRequest(
+                subscription_agreement=s_agreement,
+                amount=data['amount'],
+                recurring_amount=data['recurring_amount'],
+                recurring_frequency=data['recurring_frequency'],
+                recurring_start_date=data['recurring_start_date'],
+                link_limit=data['link_limit'],
+                link_limit_effective_timestamp=make_aware(datetime.fromtimestamp(data['link_limit_effective_timestamp']))
+            )
+            s_request.full_clean()
+            s_request.save()
+
+            price_id = _stripe_price_id_for_subscription_request(s_request)
+
+            stripe.api_key = settings.STRIPE_SECRET_KEY
+            session = stripe.checkout.Session.create(
+                mode='subscription',
+                line_items=[{'price': price_id, 'quantity': 1}],
+                success_url=settings.STRIPE_SUCCESS_URL,
+                cancel_url=settings.STRIPE_CANCEL_URL,
+                client_reference_id=s_request.reference_number,
+                metadata={
+                    'subscription_agreement_id': str(s_agreement.pk),
+                    'subscription_request_id': str(s_request.pk),
+                    'reference_number': s_request.reference_number,
+                    'customer_pk': str(s_agreement.customer_pk),
+                    'customer_type': s_agreement.customer_type,
+                },
+                subscription_data={
+                    'metadata': {
+                        'subscription_agreement_id': str(s_agreement.pk),
+                        'subscription_request_id': str(s_request.pk),
+                        'reference_number': s_request.reference_number,
+                        'customer_pk': str(s_agreement.customer_pk),
+                        'customer_type': s_agreement.customer_type,
+                    }
+                }
+            )
+
+            StripeCheckoutSession.objects.create(
+                subscription_agreement=s_agreement,
+                checkout_session_id=session.id,
+                livemode=bool(getattr(session, 'livemode', False)),
+                metadata={
+                    'price_id': price_id,
+                    'reference_number': s_request.reference_number,
+                    'customer_pk': s_agreement.customer_pk,
+                    'customer_type': s_agreement.customer_type,
+                }
+            )
+
+    except (ValidationError, ValueError, KeyError) as e:
+        logger.warning('Invalid POST from Perma.cc stripe subscribe form: {}'.format(e))
+        return bad_request(request)
+    except Exception as e:
+        # Stripe API errors, etc.
+        logger.exception("Failed to create Stripe Checkout Session: %s", e)
+        return bad_request(request)
+
+    logger.info("Stripe subscription request received for {} {}".format(data['customer_type'], data['customer_pk']))
+    return redirect(session.url)
 @csrf_exempt
 @require_http_methods(["POST"])
 @sensitive_post_parameters('encrypted_data')

@@ -194,3 +194,12 @@ LOGGING = {
         },
     },
 }
+
+
+# Stripe (pilot subscriptions flow)
+STRIPE_SECRET_KEY = ''
+STRIPE_PRICE_IDS = {}
+# These are where Stripe Checkout will redirect the browser after success/cancel.
+# Stripe recommends including the placeholder {CHECKOUT_SESSION_ID} in the success URL if you need it later.
+STRIPE_SUCCESS_URL = 'http://perma.test:8000/settings/usage-plan?stripe_session_id={CHECKOUT_SESSION_ID}'
+STRIPE_CANCEL_URL = 'http://perma.test:8000/settings/usage-plan'
