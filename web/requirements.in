@@ -16,6 +16,7 @@ pynacl                      # encryption
 python-dateutil             # for relativedelta and other utils
 werkzeug                    # for its utilities
 pytz                        # for timezone
+stripe                      # Stripe API client (pilot subscriptions flow)
 
 # Testing
 flake8                      # code linting
