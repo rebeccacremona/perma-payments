@@ -29,7 +29,7 @@ from unittest.mock import Mock
 from perma_payments.constants import CS_SUBSCRIPTION_SEARCH_URL
 from perma_payments.models import (STANDING_STATUSES,
     SubscriptionAgreement, UpdateRequestResponse, ChangeRequestResponse,
-    SubscriptionRequestResponse, PurchaseRequestResponse)
+    SubscriptionRequestResponse, PurchaseRequestResponse, StripeEvent, StripeSubscription)
 from perma_payments.security import InvalidTransmissionException
 from perma_payments.views import (FIELDS_REQUIRED_FROM_PERMA,
     FIELDS_REQUIRED_FOR_CYBERSOURCE, FIELDS_REQUIRED_FROM_CYBERSOURCE, redact)
@@ -137,6 +137,13 @@ def stripe_subscribe(subscribe):
     data['route'] = '/stripe/subscribe/'
     data.pop('template', None)
     return data
+
+
+@pytest.fixture
+def stripe_webhook():
+    return {
+        'route': '/stripe/webhook/',
+    }
 
 
 @pytest.fixture
@@ -837,6 +844,177 @@ def test_stripe_subscribe_post_happy_path_redirects_to_stripe(client, stripe_sub
     sr.assert_called_once()
     assert create_session.call_count == 1
     assert stripe_checkout_session.objects.create.call_count == 1
+
+
+# stripe/webhook
+
+
+def test_stripe_webhook_missing_signature_header_rejected(client, stripe_webhook, settings):
+    settings.STRIPE_WEBHOOK_SECRET = "whsec_test_123"
+    response = client.post(
+        stripe_webhook['route'],
+        data="{}",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    expected_template_used(response, 'generic.html')
+
+
+def test_stripe_webhook_signature_verification_failure_rejected(client, stripe_webhook, settings, mocker):
+    settings.STRIPE_WEBHOOK_SECRET = "whsec_test_123"
+    mocker.patch(
+        'perma_payments.views.stripe.Webhook.construct_event',
+        autospec=True,
+        side_effect=stripe.error.SignatureVerificationError("bad sig", "Stripe-Signature")
+    )
+    response = client.post(
+        stripe_webhook['route'],
+        data="{}",
+        content_type="application/json",
+        HTTP_STRIPE_SIGNATURE="t=1,v1=bad",
+    )
+    assert response.status_code == 400
+    expected_template_used(response, 'generic.html')
+
+
+@pytest.mark.django_db
+def test_stripe_webhook_invoice_paid_persists_event_updates_agreement_and_is_idempotent(
+    client,
+    stripe_webhook,
+    subscription_request_factory,
+    settings,
+    mocker
+):
+    settings.STRIPE_WEBHOOK_SECRET = "whsec_test_123"
+    mocker.patch('perma_payments.views.stripe.Webhook.construct_event', autospec=True, return_value=True)
+
+    sr = subscription_request_factory()
+    sa = sr.subscription_agreement
+    sa.payment_provider = 'stripe'
+    sa.status = 'Pending'
+    sa.save(update_fields=['payment_provider', 'status'])
+
+    StripeSubscription.objects.create(
+        subscription_agreement=sa,
+        subscription_id='sub_test_123',
+        customer_id='cus_test_123',
+        livemode=False,
+    )
+
+    payload = {
+        'id': 'evt_test_123',
+        'type': 'invoice.paid',
+        'livemode': False,
+        'api_version': '2020-08-27',
+        'created': 1700000000,
+        'data': {
+            'object': {
+                'subscription': 'sub_test_123',
+                'lines': {
+                    'data': [
+                        {'period': {'end': 1700003600}},
+                    ]
+                }
+            }
+        }
+    }
+
+    response1 = client.post(
+        stripe_webhook['route'],
+        data=json.dumps(payload),
+        content_type="application/json",
+        HTTP_STRIPE_SIGNATURE="t=1700000000,v1=test",
+    )
+    assert response1.status_code == 200
+    assert response1.json() == {'status': 'ok'}
+
+    sa.refresh_from_db()
+    assert sa.status == 'Current'
+    assert sa.current_frequency == sr.recurring_frequency
+    assert sa.current_rate == sr.recurring_amount
+    assert sa.current_link_limit == sr.link_limit
+    assert sa.paid_through is not None
+
+    assert StripeEvent.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_stripe_webhook_invoice_payment_paid_retrieves_invoice_and_updates_agreement(
+    client,
+    stripe_webhook,
+    subscription_request_factory,
+    settings,
+    mocker
+):
+    settings.STRIPE_WEBHOOK_SECRET = "whsec_test_123"
+    settings.STRIPE_SECRET_KEY = "sk_test_123"
+    mocker.patch('perma_payments.views.stripe.Webhook.construct_event', autospec=True, return_value=True)
+
+    sr = subscription_request_factory()
+    sa = sr.subscription_agreement
+    sa.payment_provider = 'stripe'
+    sa.status = 'Pending'
+    sa.save(update_fields=['payment_provider', 'status'])
+
+    StripeSubscription.objects.create(
+        subscription_agreement=sa,
+        subscription_id='sub_test_123',
+        customer_id='cus_test_123',
+        livemode=False,
+    )
+
+    # invoice_payment.paid points at an invoice id; handler should retrieve invoice and update agreement.
+    invoice_payment_payload = {
+        'id': 'evt_test_inpay_1',
+        'type': 'invoice_payment.paid',
+        'livemode': False,
+        'api_version': '2025-12-15.clover',
+        'created': 1700000000,
+        'data': {
+            'object': {
+                'id': 'inpay_test_1',
+                'object': 'invoice_payment',
+                'invoice': 'in_test_123',
+                'status': 'paid',
+            }
+        }
+    }
+
+    class FakeInvoice:
+        def to_dict_recursive(self):
+            return {
+                'id': 'in_test_123',
+                'subscription': 'sub_test_123',
+                'customer': 'cus_test_123',
+                'lines': {'data': [{'period': {'end': 1700003600}}]},
+                'metadata': {},
+            }
+
+    retrieve = mocker.patch('perma_payments.views.stripe.Invoice.retrieve', autospec=True, return_value=FakeInvoice())
+
+    resp = client.post(
+        stripe_webhook['route'],
+        data=json.dumps(invoice_payment_payload),
+        content_type="application/json",
+        HTTP_STRIPE_SIGNATURE="t=1700000000,v1=test",
+    )
+    assert resp.status_code == 200
+    retrieve.assert_called_once()
+
+    sa.refresh_from_db()
+    assert sa.status == 'Current'
+    ev = StripeEvent.objects.get(event_id='evt_test_inpay_1')
+    assert ev.processing_status == 'processed'
+
+    # Idempotency: second delivery should not create a second StripeEvent row.
+    response2 = client.post(
+        stripe_webhook['route'],
+        data=json.dumps(invoice_payment_payload),
+        content_type="application/json",
+        HTTP_STRIPE_SIGNATURE="t=1700000000,v1=test",
+    )
+    assert response2.status_code == 200
+    assert StripeEvent.objects.filter(event_id='evt_test_inpay_1').count() == 1
 
 
 # change

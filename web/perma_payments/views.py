@@ -3,11 +3,12 @@ from datetime import datetime
 from pytz import timezone
 from functools import wraps
 import io
+import json
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError, ObjectDoesNotExist, MultipleObjectsReturned, PermissionDenied
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.http import JsonResponse
 from django.shortcuts import render, redirect
 from django.utils.timezone import make_aware
@@ -37,6 +38,8 @@ from .models import (
     UpdateRequestResponse,
     PurchaseRequestResponse,
     StripeCheckoutSession,
+    StripeEvent,
+    StripeSubscription,
 )
 from .security import (
    InvalidTransmissionException,
@@ -226,6 +229,290 @@ def formatted_date_or_none(dt):
     if dt:
         return datetime.strftime(dt, '%Y-%m-%dT%H:%M:%S.%fZ')
     return None
+
+
+def _stripe_ts_to_dt(ts):
+    """
+    Convert Stripe unix timestamp seconds -> tz-aware datetime (UTC).
+    """
+    if ts is None:
+        return None
+    try:
+        return make_aware(datetime.utcfromtimestamp(int(ts)))
+    except Exception:
+        return None
+
+
+def _stripe_event_get(payload, path, default=None):
+    """
+    Get nested values from Stripe event payloads using a dotted path.
+    Example: _stripe_event_get(payload, "data.object.subscription")
+    """
+    cur = payload
+    for key in path.split('.'):
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return cur if cur is not None else default
+
+
+def _stripe_find_agreement_from_metadata(metadata):
+    if not isinstance(metadata, dict):
+        return None
+    sa_id = metadata.get('subscription_agreement_id')
+    if not sa_id:
+        return None
+    try:
+        return SubscriptionAgreement.objects.get(pk=int(sa_id))
+    except Exception:
+        return None
+
+
+def _stripe_find_agreement_for_subscription_id(subscription_id):
+    if not subscription_id:
+        return None
+    try:
+        return StripeSubscription.objects.select_related('subscription_agreement').get(
+            subscription_id=subscription_id
+        ).subscription_agreement
+    except StripeSubscription.DoesNotExist:
+        return None
+
+
+def _stripe_find_agreement_for_checkout_session_id(checkout_session_id):
+    if not checkout_session_id:
+        return None
+    try:
+        return StripeCheckoutSession.objects.select_related('subscription_agreement').get(
+            checkout_session_id=checkout_session_id
+        ).subscription_agreement
+    except StripeCheckoutSession.DoesNotExist:
+        return None
+
+
+def _stripe_update_agreement_from_subscription_request(agreement, status=None, paid_through=None):
+    # Keep updates minimal and CyberSource-compatible.
+    update_fields = []
+    if status and agreement.status != status:
+        agreement.status = status
+        update_fields.append('status')
+    if paid_through is not None:
+        agreement.paid_through = paid_through
+        update_fields.append('paid_through')
+
+    # Populate "current_*" fields from the originating request (if present).
+    try:
+        sr = agreement.subscription_request
+    except Exception:
+        sr = None
+
+    if sr:
+        if agreement.current_link_limit != sr.link_limit:
+            agreement.current_link_limit = sr.link_limit
+            update_fields.append('current_link_limit')
+        if agreement.current_link_limit_effective_timestamp != sr.link_limit_effective_timestamp:
+            agreement.current_link_limit_effective_timestamp = sr.link_limit_effective_timestamp
+            update_fields.append('current_link_limit_effective_timestamp')
+        if agreement.current_rate != sr.recurring_amount:
+            agreement.current_rate = sr.recurring_amount
+            update_fields.append('current_rate')
+        if agreement.current_frequency != sr.recurring_frequency:
+            agreement.current_frequency = sr.recurring_frequency
+            update_fields.append('current_frequency')
+
+    if agreement.payment_provider != 'stripe':
+        agreement.payment_provider = 'stripe'
+        update_fields.append('payment_provider')
+
+    if update_fields:
+        agreement.save(update_fields=sorted(set(update_fields)))
+
+
+def _handle_stripe_webhook_payload(payload):
+    """
+    Minimal webhook -> model updates, focused on mapping Stripe subscription lifecycle to
+    Perma-Payments' SubscriptionAgreement statuses.
+    """
+    event_type = payload.get('type')
+    obj = _stripe_event_get(payload, 'data.object', {}) or {}
+
+    if event_type == 'checkout.session.completed':
+        checkout_session_id = obj.get('id')
+        agreement = _stripe_find_agreement_from_metadata(obj.get('metadata'))
+        if not agreement:
+            agreement = _stripe_find_agreement_for_checkout_session_id(checkout_session_id)
+        if not agreement:
+            logger.warning("Stripe webhook checkout.session.completed: could not locate SubscriptionAgreement.")
+            return
+
+        # Backfill session record if missing (best-effort).
+        try:
+            StripeCheckoutSession.objects.get_or_create(
+                checkout_session_id=checkout_session_id,
+                defaults={
+                    'subscription_agreement': agreement,
+                    'livemode': bool(obj.get('livemode', False)),
+                    'metadata': obj.get('metadata') or {},
+                }
+            )
+        except Exception:
+            # If a different agreement already claimed this session id, don't crash webhook processing.
+            logger.exception("Stripe webhook: failed to upsert StripeCheckoutSession for %s", checkout_session_id)
+
+        # Some Stripe configurations include these on the Checkout Session.
+        subscription_id = obj.get('subscription')
+        customer_id = obj.get('customer')
+        if subscription_id:
+            try:
+                StripeSubscription.objects.update_or_create(
+                    subscription_id=subscription_id,
+                    defaults={
+                        'subscription_agreement': agreement,
+                        'customer_id': customer_id or '',
+                        'livemode': bool(obj.get('livemode', False)),
+                    }
+                )
+            except IntegrityError:
+                # OneToOne collision; fall back to updating the existing record for this agreement.
+                try:
+                    ss = StripeSubscription.objects.get(subscription_agreement=agreement)
+                    ss.subscription_id = subscription_id
+                    if customer_id:
+                        ss.customer_id = customer_id
+                    ss.livemode = bool(obj.get('livemode', False))
+                    ss.save(update_fields=['subscription_id', 'customer_id', 'livemode'])
+                except Exception:
+                    logger.exception(
+                        "Stripe webhook: failed to attach subscription %s to agreement %s",
+                        subscription_id,
+                        agreement.pk
+                    )
+
+        if agreement.payment_provider != 'stripe':
+            agreement.payment_provider = 'stripe'
+            agreement.save(update_fields=['payment_provider'])
+        return
+
+    if event_type in ('customer.subscription.created', 'customer.subscription.updated'):
+        subscription_id = obj.get('id')
+        agreement = _stripe_find_agreement_from_metadata(obj.get('metadata'))
+        if not agreement:
+            agreement = _stripe_find_agreement_for_subscription_id(subscription_id)
+        if not agreement:
+            logger.warning("Stripe webhook %s: could not locate SubscriptionAgreement.", event_type)
+            return
+        try:
+            StripeSubscription.objects.update_or_create(
+                subscription_id=subscription_id,
+                defaults={
+                    'subscription_agreement': agreement,
+                    'customer_id': obj.get('customer') or '',
+                    'livemode': bool(obj.get('livemode', False)),
+                }
+            )
+        except IntegrityError:
+            try:
+                ss = StripeSubscription.objects.get(subscription_agreement=agreement)
+                ss.subscription_id = subscription_id
+                ss.customer_id = obj.get('customer') or ss.customer_id
+                ss.livemode = bool(obj.get('livemode', False))
+                ss.save(update_fields=['subscription_id', 'customer_id', 'livemode'])
+            except Exception:
+                logger.exception("Stripe webhook: failed to upsert StripeSubscription for %s", subscription_id)
+        if agreement.payment_provider != 'stripe':
+            agreement.payment_provider = 'stripe'
+            agreement.save(update_fields=['payment_provider'])
+        return
+
+    paid_invoice_events = ('invoice.paid', 'invoice.payment_succeeded', 'invoice_payment.paid')
+    failed_invoice_events = ('invoice.payment_failed', 'invoice_payment.failed')
+
+    if event_type in paid_invoice_events + failed_invoice_events:
+        # Normalize to an Invoice-like dict when we get invoice_payment.* events.
+        if event_type.startswith('invoice_payment.'):
+            invoice_id = obj.get('invoice')
+            if not invoice_id:
+                logger.warning("Stripe webhook %s: missing invoice id on invoice_payment object.", event_type)
+                return
+            if not getattr(settings, 'STRIPE_SECRET_KEY', ''):
+                logger.error("STRIPE_SECRET_KEY is not configured; cannot retrieve invoice %s for %s.", invoice_id, event_type)
+                return
+            try:
+                stripe.api_key = settings.STRIPE_SECRET_KEY
+                invoice = stripe.Invoice.retrieve(invoice_id, expand=['lines.data'])
+                # Convert StripeObject -> plain dict (stripy but stable enough for our usage)
+                invoice_obj = invoice.to_dict_recursive() if hasattr(invoice, 'to_dict_recursive') else dict(invoice)
+            except Exception:
+                logger.exception("Stripe webhook %s: failed to retrieve invoice %s.", event_type, invoice_id)
+                return
+        else:
+            invoice_obj = obj
+
+        invoice_id = invoice_obj.get('id')
+        subscription_id = invoice_obj.get('subscription')
+        customer_id = invoice_obj.get('customer')
+
+        # Correlate to SubscriptionAgreement.
+        agreement = None
+        agreement = _stripe_find_agreement_from_metadata(invoice_obj.get('metadata'))
+        if not agreement:
+            agreement = _stripe_find_agreement_from_metadata(
+                _stripe_event_get({'data': {'object': invoice_obj}}, 'data.object.subscription_details.metadata')
+            )
+        if not agreement:
+            lines = invoice_obj.get('lines', {}).get('data', []) if isinstance(invoice_obj.get('lines'), dict) else []
+            for line in lines:
+                agreement = _stripe_find_agreement_from_metadata(line.get('metadata'))
+                if agreement:
+                    break
+        if not agreement and subscription_id:
+            agreement = _stripe_find_agreement_for_subscription_id(subscription_id)
+        if not agreement and customer_id:
+            ss = StripeSubscription.objects.select_related('subscription_agreement').filter(
+                customer_id=customer_id
+            ).order_by('-updated_date').first()
+            agreement = ss.subscription_agreement if ss else None
+
+        if not agreement:
+            logger.warning(
+                "Stripe webhook %s: could not locate SubscriptionAgreement (invoice=%s, subscription=%s, customer=%s).",
+                event_type,
+                invoice_id,
+                subscription_id,
+                customer_id
+            )
+            return
+
+        if event_type in paid_invoice_events:
+            end_ts = None
+            lines = invoice_obj.get('lines', {}).get('data', []) if isinstance(invoice_obj.get('lines'), dict) else []
+            for line in lines:
+                try:
+                    period = line.get('period') or {}
+                    candidate = period.get('end')
+                    if candidate is not None:
+                        end_ts = max(end_ts or candidate, candidate)
+                except Exception:
+                    continue
+            paid_through = _stripe_ts_to_dt(end_ts)
+            _stripe_update_agreement_from_subscription_request(agreement, status='Current', paid_through=paid_through)
+        else:
+            _stripe_update_agreement_from_subscription_request(agreement, status='Hold')
+        return
+
+    if event_type == 'customer.subscription.deleted':
+        subscription_id = obj.get('id')
+        agreement = _stripe_find_agreement_from_metadata(obj.get('metadata'))
+        if not agreement:
+            agreement = _stripe_find_agreement_for_subscription_id(subscription_id)
+        if not agreement:
+            logger.warning("Stripe webhook customer.subscription.deleted: could not locate SubscriptionAgreement.")
+            return
+        _stripe_update_agreement_from_subscription_request(agreement, status='Canceled')
+        return
+
+    # Unhandled events are still persisted; we just skip business logic for now.
+    return
 
 
 def _stripe_price_id_for_subscription_request(subscription_request):
@@ -536,6 +823,96 @@ def stripe_subscribe(request):
 
     logger.info("Stripe subscription request received for {} {}".format(data['customer_type'], data['customer_pk']))
     return redirect(session.url)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def stripe_webhook(request):
+    """
+    Stripe webhook endpoint (pilot).
+
+    - Verifies signature (STRIPE_WEBHOOK_SECRET).
+    - Persists every event to StripeEvent (encrypted) for audit/debug + idempotency.
+    - Applies minimal event handlers to keep SubscriptionAgreement up to date.
+    """
+    webhook_secret = getattr(settings, 'STRIPE_WEBHOOK_SECRET', '')
+    if not webhook_secret:
+        logger.error("STRIPE_WEBHOOK_SECRET is not configured; rejecting Stripe webhook.")
+        return bad_request(request)
+
+    payload_bytes = request.body or b''
+    sig_header = request.META.get('HTTP_STRIPE_SIGNATURE', '')
+    if not sig_header:
+        logger.warning("Stripe webhook missing Stripe-Signature header.")
+        return bad_request(request)
+
+    try:
+        # Verify signature (also validates payload structure).
+        stripe.Webhook.construct_event(payload_bytes, sig_header, webhook_secret)
+        payload = json.loads(payload_bytes.decode('utf-8'))
+    except (ValueError, json.JSONDecodeError):
+        logger.warning("Stripe webhook: invalid JSON payload.")
+        return bad_request(request)
+    except stripe.error.SignatureVerificationError:
+        logger.warning("Stripe webhook: signature verification failed.")
+        return bad_request(request)
+    except Exception:
+        logger.exception("Stripe webhook: unexpected error verifying payload.")
+        return bad_request(request)
+
+    event_id = payload.get('id')
+    if not event_id:
+        logger.warning("Stripe webhook: missing event id.")
+        return bad_request(request)
+
+    event_type = payload.get('type', '')
+    livemode = bool(payload.get('livemode', False))
+    api_version = payload.get('api_version')
+    created_dt = _stripe_ts_to_dt(payload.get('created'))
+
+    # Persist-before-processing, with idempotency and retry-on-failed semantics.
+    with transaction.atomic():
+        try:
+            # Use a nested atomic block (savepoint) so an IntegrityError on the unique
+            # event_id constraint doesn't poison the outer transaction.
+            with transaction.atomic():
+                stripe_event = StripeEvent.save_new_with_encrypted_payload(
+                    payload,
+                    {
+                        'event_id': event_id,
+                        'type': event_type,
+                        'api_version': api_version,
+                        'livemode': livemode,
+                        'created': created_dt,
+                    }
+                )
+                created_new = True
+        except IntegrityError:
+            stripe_event = StripeEvent.objects.select_for_update().get(event_id=event_id)
+            created_new = False
+
+        if stripe_event.processing_status == 'processed' and not created_new:
+            return JsonResponse({'status': 'ok'})
+
+        processing_error = None
+        try:
+            _handle_stripe_webhook_payload(payload)
+        except Exception as e:
+            processing_error = e
+
+        stripe_event.processed_at = make_aware(datetime.utcnow())
+        if processing_error is None:
+            stripe_event.processing_status = 'processed'
+            stripe_event.last_error = None
+            stripe_event.save(update_fields=['processing_status', 'last_error', 'processed_at'])
+            return JsonResponse({'status': 'ok'})
+
+        stripe_event.processing_status = 'failed'
+        stripe_event.last_error = str(processing_error)
+        stripe_event.save(update_fields=['processing_status', 'last_error', 'processed_at'])
+        return JsonResponse({'status': 'error'}, status=500)
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 @sensitive_post_parameters('encrypted_data')

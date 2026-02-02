@@ -198,6 +198,7 @@ LOGGING = {
 
 # Stripe (pilot subscriptions flow)
 STRIPE_SECRET_KEY = ''
+STRIPE_WEBHOOK_SECRET = ''
 STRIPE_PRICE_IDS = {}
 # These are where Stripe Checkout will redirect the browser after success/cancel.
 # Stripe recommends including the placeholder {CHECKOUT_SESSION_ID} in the success URL if you need it later.
